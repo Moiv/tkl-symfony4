@@ -6,9 +6,12 @@ DB_PASS=$(mcookie)
 WEBROOT=/var/www/symfony
 LOCAL_SRC=/usr/local/src
 
+# Version of symfony to install
+SYMFONY_VERSION=4.3
+
 # php tweaks
-PHPINI1=/etc/php/7.0/apache2/php.ini
-PHPINI2=/etc/php/7.0/cli/php.ini
+PHPINI1=/etc/php/7.2/apache2/php.ini
+PHPINI2=/etc/php/7.2/cli/php.ini
 
 # Set timezone (TODO: we should move this to an inithook)
 sed -i "s|^;date.timezone\(.*\)|date.timezone = 'America/Los_Angeles'|" $PHPINI1
@@ -33,49 +36,38 @@ GRANT ALL PRIVILEGES ON $NAME.* TO $NAME@localhost IDENTIFIED BY '$DB_PASS'; \
 FLUSH PRIVILEGES;"
 
 # install 3.4.x LTS symfony
-symfony new /var/www/symfony 3.4
+#composer create-project symfony/symfony-demo /var/www/symfony-demo
+composer create-project symfony/website-skeleton $WEBROOT
 
 # Change owner to root
 chown root:root -R $WEBROOT
-
-# config database
-cat > $WEBROOT/app/config/parameters.yml <<EOF
-parameters:
-    database_driver:   pdo_mysql
-    database_host:     127.0.0.1
-    database_port:     ~
-    database_name:     symfony
-    database_user:     $NAME
-    database_password: $DB_PASS
-
-    mailer_transport:  smtp
-    mailer_host:       127.0.0.1
-    mailer_user:       ~
-    mailer_password:   ~
-
-    secret:            $(mcookie)
-EOF
 
 
 # Set permissions so that cache and logs can be updated by apache2 user
 chown -R www-data:www-data $WEBROOT/var
 
 # update .htaccess -  setup app_dev as default
-HTACCESS=$WEBROOT/web/.htaccess
+HTACCESS=$WEBROOT/public/.htaccess
 
 cat > $HTACCESS <<EOF
-# This file has been changed to point to the app_dev.php front controller
-# to allow development. On a production server this should be changed back
-# to the default controller "app.php"
-#
-# To do this, edit this file and change all app_dev.php to app.php
-
 # Use the front controller as index file. It serves as a fallback solution when
 # every other rewrite/redirect fails (e.g. in an aliased environment without
 # mod_rewrite). Additionally, this reduces the matching process for the
 # start page (path "/") because otherwise Apache will apply the rewriting rules
 # to each configured DirectoryIndex file (e.g. index.php, index.html, index.pl).
-DirectoryIndex app_dev.php
+DirectoryIndex index.php
+
+# By default, Apache does not evaluate symbolic links if you did not enable this
+# feature in your server configuration. Uncomment the following line if you
+# install assets as symlinks or if you experience problems related to symlinks
+# when compiling LESS/Sass/CoffeScript assets.
+# Options FollowSymlinks
+
+# Disabling MultiViews prevents unwanted negotiation, e.g. "/index" should not resolve
+# to the front controller "/index.php" but be rewritten to "/index.php/index".
+<IfModule mod_negotiation.c>
+    Options -MultiViews
+</IfModule>
 
 <IfModule mod_rewrite.c>
     RewriteEngine On
@@ -83,16 +75,19 @@ DirectoryIndex app_dev.php
     # Determine the RewriteBase automatically and set it as environment variable.
     # If you are using Apache aliases to do mass virtual hosting or installed the
     # project in a subdirectory, the base path will be prepended to allow proper
-    # resolution of the app.php file and to redirect to the correct URI. It will
+    # resolution of the index.php file and to redirect to the correct URI. It will
     # work in environments without path prefix as well, providing a safe, one-size
     # fits all solution. But as you do not need it in this case, you can comment
     # the following 2 lines to eliminate the overhead.
-    
-    RewriteCond %{REQUEST_URI}::\$1 ^(/.+)/(.*)::\2$
+    RewriteCond %{REQUEST_URI}::$1 ^(/.+)/(.*)::\2$
     RewriteRule ^(.*) - [E=BASE:%1]
 
+    # Sets the HTTP_AUTHORIZATION header removed by Apache
+    RewriteCond %{HTTP:Authorization} .
+    RewriteRule ^ - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
     # Redirect to URI without front controller to prevent duplicate content
-    # (with and without \`/app.php\`). Only do this redirect on the initial
+    # (with and without `/index.php`). Only do this redirect on the initial
     # rewrite by Apache and not on subsequent cycles. Otherwise we would get an
     # endless redirect loop (request -> rewrite to front controller ->
     # redirect -> request -> ...).
@@ -102,19 +97,16 @@ DirectoryIndex app_dev.php
     # - disable this feature by commenting the following 2 lines or
     # - use Apache >= 2.3.9 and replace all L flags by END flags and remove the
     #   following RewriteCond (best solution)
-    
     RewriteCond %{ENV:REDIRECT_STATUS} ^$
-    RewriteRule ^app\.php(/(.*)|$) %{ENV:BASE}/\$2 [R=301,L]
+    RewriteRule ^index\.php(?:/(.*)|$) %{ENV:BASE}/$1 [R=301,L]
 
     # If the requested filename exists, simply serve it.
     # We only want to let Apache serve files and not directories.
-    
     RewriteCond %{REQUEST_FILENAME} -f
-    RewriteRule .? - [L]
+    RewriteRule ^ - [L]
 
     # Rewrite all other queries to the front controller.
-    
-    RewriteRule .? %{ENV:BASE}/app_dev.php [L]
+    RewriteRule ^ %{ENV:BASE}/index.php [L]
 </IfModule>
 
 <IfModule !mod_rewrite.c>
@@ -122,42 +114,30 @@ DirectoryIndex app_dev.php
         # When mod_rewrite is not available, we instruct a temporary redirect of
         # the start page to the front controller explicitly so that the website
         # and the generated links can still be used.
-        
-        RedirectMatch 302 ^/$ /app_dev.php/
-        
+        RedirectMatch 307 ^/$ /index.php/
         # RedirectTemp cannot be used instead
     </IfModule>
 </IfModule>
 EOF
 
 
-
-# Update app_dev.php - Allow all requests for access for dev only
-# Needs so out of the box any IP can access the dev front controller
-
-APPDEV=$WEBROOT/web/app_dev.php
-
-sed -i "s|header('HTTP/1.0 403 Forbidden');|#header('HTTP/1.0 403 Forbidden');|" $APPDEV
-sed -i "s|exit('You are not allowed to access this file. Check '.basename(__FILE__).' for more information.');|#exit('You are not allowed to access this file. Check '.basename(__FILE__).' for more information.');|" $APPDEV 
-
-
 # Update default twig template (Give it a TKL Branding)
-TEMPLATE=$WEBROOT/app/Resources/views/default/index.html.twig
+TEMPLATE=$WEBROOT/templates/base.html.twig
 
 # update welcome template, part 1 - Welcome
 # Adds TurnKey Linux to the welcome
-sed -i "s|<h1>\(.*\)</h1>|<h1>Welcome to TurnKey Symfony</h1>|" $TEMPLATE
+sed -i "s|<h1>\(.*\)</h1>|<h1>Welcome to TurnKey Symfony 4.3</h1>|" $TEMPLATE
 
 # update welcome template, part 2 - Whats next
 # Use SED to find the whats next text inside the twig file
 # then we insert multi line html into it
-sed -i "s|<h2>What's next?</h2>| \n\
-                <h2>What do I do now?</h2>\n\
-                        <p>This welcome page is being served via app_dev.php.</p> \n\
-                        <p>You should secure it by specifying your IP address in <i>$APPDEV</i></p> \n\
-                        <p>When ready for production, update <i>$HTACCESS</i> to specify app.php instead.</p> \n\
-                        <p><i>Note: The database configuration is already setup for you, enjoy!</i></p> \n\
-|" $TEMPLATE
+#sed -i "s|<h2>What's next?</h2>| \n\
+#                <h2>What do I do now?</h2>\n\
+#                        <p>This welcome page is being served via index.php</p> \n\
+#                        <p>You should secure it by specifying your IP address in <i>$APPDEV</i></p> \n\
+#                        <p>When ready for production, update <i>$HTACCESS</i> to specify app.php instead.</p> \n\
+#                        <p><i>Note: The database configuration is already setup for you, enjoy!</i></p> \n\
+#|" $TEMPLATE
 
 
 
